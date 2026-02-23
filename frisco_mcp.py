@@ -39,6 +39,13 @@ async def ensure_logged_in(email: str, password: str) -> bool:
 
     try:
         await page.click("button.cta:has-text('Akceptuję'), button[id*='accept'], button[class*='accept']", timeout=2000)
+        await page.wait_for_timeout(800)
+    except Exception:
+        pass
+
+    try:
+        await page.click("button.modal-new_close", timeout=2000)
+        await page.wait_for_timeout(500)
     except Exception:
         pass
 
