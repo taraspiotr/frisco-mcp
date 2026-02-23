@@ -38,7 +38,7 @@ async def ensure_logged_in(email: str, password: str) -> bool:
     await page.wait_for_load_state("networkidle")
 
     try:
-        await page.click("button[id*='accept'], button[class*='accept']", timeout=2000)
+        await page.click("button.cta:has-text('Akceptuję'), button[id*='accept'], button[class*='accept']", timeout=2000)
     except Exception:
         pass
 
@@ -94,7 +94,7 @@ async def add_items_to_cart(email: str, password: str, items: str) -> str:
             await page.wait_for_timeout(800)
 
             product_cards = await page.query_selector_all(
-                "[class*='ProductTile'], [class*='product-tile'], [class*='productTile']"
+                ".product-box, .mini-product-box"
             )
 
             if not product_cards:
@@ -103,19 +103,19 @@ async def add_items_to_cart(email: str, password: str, items: str) -> str:
 
             card = product_cards[0]
 
-            name_el = await card.query_selector("[class*='Name'], [class*='name'], h3")
+            name_el = await card.query_selector("[class*='info-name'], h3")
             found_name = (await name_el.inner_text()).strip() if name_el else name
 
-            price_el = await card.query_selector("[class*='Price'], [class*='price']")
+            price_el = await card.query_selector("[class*='normal-price'], [class*='price']")
             price = (await price_el.inner_text()).strip() if price_el else "?"
 
             add_btn = await card.query_selector(
-                "button[class*='add'], button[class*='Add'], button[class*='cart'], [class*='AddToCart']"
+                "[class*='cart-button'], button[class*='add'], button[class*='cart']"
             )
             if not add_btn:
                 await card.hover()
                 await page.wait_for_timeout(300)
-                add_btn = await card.query_selector("button")
+                add_btn = await card.query_selector("button, [class*='cart']")
 
             if add_btn:
                 await add_btn.click()
