@@ -37,22 +37,25 @@ async def ensure_logged_in(email: str, password: str) -> bool:
     await page.goto("https://www.frisco.pl/login")
     await page.wait_for_load_state("networkidle")
 
+    # Accept cookie consent
     try:
-        await page.click("button.cta:has-text('Akceptuję'), button[id*='accept'], button[class*='accept']", timeout=2000)
+        await page.get_by_role("button", name="Akceptuję").click(timeout=3000)
         await page.wait_for_timeout(800)
     except Exception:
         pass
 
+    # Close postcode popup
     try:
         await page.click("button.modal-new_close", timeout=2000)
         await page.wait_for_timeout(500)
     except Exception:
         pass
 
+    # Fill login form and submit
     try:
-        await page.fill("input[type='email']", email)
-        await page.fill("input[type='password']", password)
-        await page.click("button.cta:has-text('Zaloguj'), button[type='submit']")
+        await page.get_by_role("textbox", name="Adres e-mail").fill(email)
+        await page.get_by_role("textbox", name="Hasło").fill(password)
+        await page.get_by_role("button", name="Zaloguj").click()
         await page.wait_for_url(lambda url: "login" not in url, timeout=10000)
         _logged_in = True
         return True
@@ -94,40 +97,36 @@ async def add_items_to_cart(email: str, password: str, items: str) -> str:
         qty = item.get("quantity", 1)
 
         try:
-            await page.goto(f"https://www.frisco.pl/search?q={query}&pg=1")
+            # Search using the header search box (two-step: click header → type in expanded input)
+            await page.get_by_role("textbox", name="Wyszukaj").click()
+            search_input = page.get_by_role("textbox", name="Jakiego produktu szukasz?")
+            await search_input.fill(query)
+            await search_input.press("Enter")
             await page.wait_for_load_state("networkidle")
             await page.wait_for_timeout(800)
 
-            product_cards = await page.query_selector_all(
-                ".product-box, .mini-product-box"
-            )
-
-            if not product_cards:
+            # Click first product link (URLs contain /pid,)
+            first_product = page.locator("a[href*='/pid,']").first
+            if await first_product.count() == 0:
                 results.append(f"⚠️  {name}: nie znaleziono")
                 continue
 
-            card = product_cards[0]
+            found_name = (await first_product.inner_text()).strip()[:60]
+            await first_product.click()
+            await page.wait_for_load_state("networkidle")
+            await page.wait_for_timeout(800)
 
-            name_el = await card.query_selector("[class*='info-name'], h3")
-            found_name = (await name_el.inner_text()).strip() if name_el else name
+            # Add to cart (click qty times)
+            add_btn = page.get_by_text("Do koszyka", exact=True).first
+            if await add_btn.count() == 0:
+                results.append(f"⚠️  {name}: znaleziono '{found_name}' ale brak przycisku 'Do koszyka'")
+                continue
 
-            price_el = await card.query_selector("[class*='normal-price'], [class*='price']")
-            price = (await price_el.inner_text()).strip() if price_el else "?"
-
-            add_btn = await card.query_selector(
-                "[class*='cart-button'], button[class*='add'], button[class*='cart']"
-            )
-            if not add_btn:
-                await card.hover()
-                await page.wait_for_timeout(300)
-                add_btn = await card.query_selector("button, [class*='cart']")
-
-            if add_btn:
+            for _ in range(qty):
                 await add_btn.click()
-                await page.wait_for_timeout(600)
-                results.append(f"✅ {found_name} ({price}) x{qty}")
-            else:
-                results.append(f"⚠️  {name}: znaleziono '{found_name}' ale brak przycisku Dodaj")
+                await page.wait_for_timeout(400)
+
+            results.append(f"✅ {found_name} x{qty}")
 
         except Exception as e:
             results.append(f"❌ {name}: {str(e)[:80]}")
