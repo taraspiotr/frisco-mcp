@@ -53,11 +53,9 @@ async def ensure_logged_in(email: str, password: str) -> bool:
         await page.fill("input[type='email']", email)
         await page.fill("input[type='password']", password)
         await page.click("button.cta:has-text('Zaloguj'), button[type='submit']")
-        await page.wait_for_load_state("networkidle")
-        if "login" not in page.url:
-            _logged_in = True
-            return True
-        return False
+        await page.wait_for_url(lambda url: "login" not in url, timeout=10000)
+        _logged_in = True
+        return True
     except Exception:
         return False
 
