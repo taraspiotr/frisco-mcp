@@ -21,7 +21,7 @@ MCP server for [Frisco.pl](https://www.frisco.pl) — lets Claude add groceries 
 ## Installation
 
 ```bash
-git clone https://github.com/tarasiewicz/frisco-mcp.git
+git clone https://github.com/taraspiotr/frisco-mcp.git
 cd frisco-mcp
 uv sync          # or: pip install mcp playwright
 playwright install chromium
