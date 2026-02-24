@@ -23,8 +23,23 @@ _browser = None
 _page = None
 _logged_in = False
 
-# ── Recipes storage ──────────────────────────────────────────────────────────
-_RECIPES_PATH = Path.home() / ".frisco-mcp" / "recipes.json"
+# ── Credentials + Recipes storage ────────────────────────────────────────────
+_DATA_DIR = Path.home() / ".frisco-mcp"
+_CREDS_PATH = _DATA_DIR / "credentials.json"
+_RECIPES_PATH = _DATA_DIR / "recipes.json"
+
+
+def _get_credentials(email: str = "", password: str = "") -> tuple[str, str]:
+    """Return (email, password): use provided values or fall back to credentials file."""
+    if email and password:
+        return email, password
+    if _CREDS_PATH.exists():
+        try:
+            c = json.loads(_CREDS_PATH.read_text())
+            return c.get("email", ""), c.get("password", "")
+        except Exception:
+            pass
+    return email, password
 
 
 def _load_recipes() -> dict:
@@ -229,13 +244,11 @@ def delete_recipe(name: str) -> str:
 # ── Cart tools ───────────────────────────────────────────────────────────────
 
 @mcp.tool()
-async def add_items_to_cart(email: str, password: str, items: str) -> str:
+async def add_items_to_cart(items: str, email: str = "", password: str = "") -> str:
     """
     Loguje się do Frisco.pl i dodaje produkty do koszyka.
 
     Parametry:
-    - email: adres email konta Frisco
-    - password: hasło do konta Frisco
     - items: lista produktów jako JSON string, np:
       '[{"name":"mleko","quantity":2,"search_query":"mleko"},{"name":"chleb","search_query":"chleb pszenny"}]'
 
@@ -244,6 +257,7 @@ async def add_items_to_cart(email: str, password: str, items: str) -> str:
 
     WAŻNE: Agent NIE dokonuje płatności. Zatrzymuje się na etapie koszyka.
     """
+    email, password = _get_credentials(email, password)
     try:
         products = json.loads(items)
     except Exception:
@@ -292,8 +306,9 @@ Przeglądarka jest otwarta — możesz od razu przejść do kasy.
 
 
 @mcp.tool()
-async def view_cart(email: str, password: str) -> str:
+async def view_cart(email: str = "", password: str = "") -> str:
     """Otwiera koszyk Frisco.pl i zwraca jego zawartość."""
+    email, password = _get_credentials(email, password)
     logged = await ensure_logged_in(email, password)
     if not logged:
         return "❌ Nie udało się zalogować."
@@ -377,7 +392,7 @@ async def clear_session() -> str:
 # ── Product info tools ───────────────────────────────────────────────────────
 
 @mcp.tool()
-async def search_products(email: str, password: str, query: str, top_n: int = 5) -> str:
+async def search_products(query: str, top_n: int = 5, email: str = "", password: str = "") -> str:
     """
     Wyszukuje produkty na Frisco.pl i zwraca listę z nazwami i cenami.
     Przydatne do porównywania produktów i wyboru zdrowych opcji.
@@ -387,6 +402,7 @@ async def search_products(email: str, password: str, query: str, top_n: int = 5)
     - query: fraza wyszukiwania (np. "jogurt naturalny")
     - top_n: ile produktów zwrócić (domyślnie 5)
     """
+    email, password = _get_credentials(email, password)
     logged = await ensure_logged_in(email, password)
     if not logged:
         return "❌ Nie udało się zalogować."
@@ -442,7 +458,7 @@ async def search_products(email: str, password: str, query: str, top_n: int = 5)
 
 
 @mcp.tool()
-async def get_product_info(email: str, password: str, query: str) -> str:
+async def get_product_info(query: str, email: str = "", password: str = "") -> str:
     """
     Wyszukuje produkt i zwraca szczegółowe informacje: makroskładniki i listę składników.
     Przydatne do oceny wartości odżywczych produktu.
@@ -451,6 +467,7 @@ async def get_product_info(email: str, password: str, query: str) -> str:
     - email, password: dane logowania
     - query: fraza wyszukiwania (np. "masło ekstra")
     """
+    email, password = _get_credentials(email, password)
     logged = await ensure_logged_in(email, password)
     if not logged:
         return "❌ Nie udało się zalogować."
@@ -633,7 +650,7 @@ async def get_product_info(email: str, password: str, query: str) -> str:
 
 @mcp.tool()
 async def add_recipe_to_cart(
-    email: str, password: str, recipe_name: str, servings: int = 0
+    recipe_name: str, servings: int = 0, email: str = "", password: str = ""
 ) -> str:
     """
     Wyszukuje przepis i dodaje wszystkie składniki do koszyka Frisco.pl.
@@ -654,6 +671,7 @@ async def add_recipe_to_cart(
         available = ", ".join(r["name"] for r in data["recipes"]) or "brak"
         return f"❌ Nie znaleziono przepisu '{recipe_name}'.\nDostępne przepisy: {available}"
 
+    email, password = _get_credentials(email, password)
     logged = await ensure_logged_in(email, password)
     if not logged:
         return "❌ Nie udało się zalogować do Frisco.pl. Sprawdź email i hasło."
