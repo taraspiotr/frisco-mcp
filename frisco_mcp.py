@@ -102,29 +102,34 @@ async def add_items_to_cart(email: str, password: str, items: str) -> str:
             search_input = page.get_by_role("textbox", name="Jakiego produktu szukasz?")
             await search_input.fill(query)
             await search_input.press("Enter")
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(800)
+            await page.wait_for_load_state("domcontentloaded")
+            await page.wait_for_timeout(2000)
 
-            # Click first product link (URLs contain /pid,)
-            first_product = page.locator("a[href*='/pid,']").first
-            if await first_product.count() == 0:
+            # Find first visible "Do koszyka" button on the search results page
+            koszyk_btns = page.get_by_text("Do koszyka")
+            count = await koszyk_btns.count()
+            add_btn = None
+            for i in range(count):
+                btn = koszyk_btns.nth(i)
+                if await btn.is_visible():
+                    add_btn = btn
+                    break
+
+            if add_btn is None:
                 results.append(f"⚠️  {name}: nie znaleziono")
                 continue
 
-            found_name = (await first_product.inner_text()).strip()[:60]
-            await first_product.click()
-            await page.wait_for_load_state("networkidle")
-            await page.wait_for_timeout(800)
+            # Get product name from parent product-box_holder's link title
+            found_name = await add_btn.evaluate("""el => {
+                const box = el.closest('.product-box_holder');
+                const link = box && box.querySelector('a[title]');
+                return link ? link.title : '';
+            }""") or name
 
-            # Add to cart (click qty times)
-            add_btn = page.get_by_text("Do koszyka", exact=True).first
-            if await add_btn.count() == 0:
-                results.append(f"⚠️  {name}: znaleziono '{found_name}' ale brak przycisku 'Do koszyka'")
-                continue
-
+            # Click qty times
             for _ in range(qty):
                 await add_btn.click()
-                await page.wait_for_timeout(400)
+                await page.wait_for_timeout(500)
 
             results.append(f"✅ {found_name} x{qty}")
 
