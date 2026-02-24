@@ -52,6 +52,22 @@ async def get_page():
     return _page
 
 
+async def _clear_cart(page) -> int:
+    """Remove all items from cart. Returns number of items removed."""
+    await page.goto("https://www.frisco.pl/stn,cart")
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_timeout(2000)
+    removed = 0
+    for _ in range(100):
+        btn = page.locator(".horizontal-product-box__delete-button").first
+        if not await btn.is_visible():
+            break
+        await btn.click()
+        await page.wait_for_timeout(600)
+        removed += 1
+    return removed
+
+
 async def ensure_logged_in(email: str, password: str) -> bool:
     global _logged_in
     if _logged_in:
@@ -83,6 +99,7 @@ async def ensure_logged_in(email: str, password: str) -> bool:
         await page.get_by_role("button", name="Zaloguj").click()
         await page.wait_for_url(lambda url: "login" not in url, timeout=10000)
         _logged_in = True
+        await _clear_cart(page)
         return True
     except Exception:
         return False
@@ -288,11 +305,11 @@ async def view_cart(email: str, password: str) -> str:
 
     try:
         result = await page.evaluate("""() => {
+            // Only include product boxes that have a delete button — real cart items
             const boxes = Array.from(document.querySelectorAll('.product-box_holder'))
-                .filter(el => el.offsetParent !== null);
+                .filter(el => el.offsetParent !== null &&
+                    el.querySelector('.horizontal-product-box__delete-button'));
 
-            // Deduplicate: if the same product appears in two sections (list + summary strip),
-            // keep the entry with a price; otherwise keep first seen.
             const byName = new Map();
             boxes.forEach(box => {
                 const nameEl = box.querySelector('a[title]');
