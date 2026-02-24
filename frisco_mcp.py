@@ -22,6 +22,7 @@ mcp = FastMCP("Frisco Shopping Agent")
 _browser = None
 _page = None
 _logged_in = False
+_product_cache: dict = {}  # {search_query → {name, url, macros, ingredients, price}}
 
 # ── Credentials + Recipes storage ────────────────────────────────────────────
 _DATA_DIR = Path.home() / ".frisco-mcp"
@@ -142,6 +143,215 @@ async def _search_and_get_first_product(page, query: str) -> tuple[str, str | No
             return found_name, btn
 
     return query, None
+
+
+# ── Macro extraction JS (reused by _search_navigate_and_cache and get_product_info) ──
+
+_MACRO_JS = r"""() => {
+    // Product name
+    const h1 = document.querySelector('h1');
+    const name = h1 ? h1.innerText.trim() : '?';
+
+    // Price
+    const priceEl = document.querySelector('[class*="price"], [class*="Price"]');
+    const price = priceEl ? priceEl.innerText.trim().replace(/\s+/g, ' ') : '';
+
+    // Full page text for parsing
+    const bodyText = document.body.innerText;
+
+    // Ingredients: match "Skład:" OR content on the line after "Skład i alergeny" header
+    let ingredients = null;
+    const skladColon = bodyText.match(/Sk[łl]ad\s*[:：]\s*([^\n]{5,})/i);
+    if (skladColon) {
+        ingredients = skladColon[1].trim();
+    } else {
+        // "Skład i alergeny" accordion: grab the next non-empty line(s)
+        const skladSection = bodyText.match(/Sk[łl]ad i alergeny[\s\S]{0,10}\n+([^\n]{5,})/i);
+        if (skladSection) ingredients = skladSection[1].trim();
+    }
+
+    // Macros: walk table rows and definition lists
+    const macros = {};
+    const keyMap = {
+        'kcal': 'kcal',
+        'energia': 'kcal',
+        'białko': 'białko',
+        'bialko': 'białko',
+        'tłuszcz': 'tłuszcz',
+        'tluszcz': 'tłuszcz',
+        'węglowodan': 'węglowodany',
+        'weglowodan': 'węglowodany',
+        'cukr': 'cukry',
+        'błonnik': 'błonnik',
+        'blonnik': 'błonnik',
+        'sól': 'sól',
+        'sol': 'sól',
+    };
+
+    function extractMacro(label, value) {
+        const lc = label.toLowerCase();
+        for (const [key, canonical] of Object.entries(keyMap)) {
+            if (lc.includes(key) && !macros[canonical]) {
+                macros[canonical] = value.trim().replace(/\s+/g, ' ');
+                break;
+            }
+        }
+    }
+
+    // Try <tr> rows
+    document.querySelectorAll('tr').forEach(tr => {
+        const cells = tr.querySelectorAll('td, th');
+        if (cells.length >= 2) {
+            extractMacro(cells[0].innerText, cells[1].innerText);
+        }
+    });
+
+    // Try <dt>/<dd> pairs
+    document.querySelectorAll('dt').forEach(dt => {
+        const dd = dt.nextElementSibling;
+        if (dd && dd.tagName === 'DD') {
+            extractMacro(dt.innerText, dd.innerText);
+        }
+    });
+
+    // Try adjacent sibling divs: label div + value div pattern
+    // Walk all leaf-ish divs/spans; if text looks like a macro keyword,
+    // grab the next sibling's text as the value.
+    document.querySelectorAll('div, span, p, li').forEach(el => {
+        if (el.children.length > 2) return; // skip containers
+        const text = (el.innerText || '').trim();
+        if (!text || text.length > 60) return;
+        const next = el.nextElementSibling;
+        if (next && next.children.length <= 2) {
+            extractMacro(text, next.innerText || '');
+        }
+    });
+
+    // Fallback: regex scan of full page text for kcal only
+    if (!macros['kcal']) {
+        const m = bodyText.match(/([\d]+)\s*kcal/i);
+        if (m) macros['kcal'] = m[1] + ' kcal';
+    }
+
+    return { name, price, ingredients, macros };
+}"""
+
+
+def _format_product_info(data: dict) -> str:
+    """Format a cached/live product info dict into a human-readable string."""
+    name = data.get("name", "?")
+    price = data.get("price", "")
+    ingredients = data.get("ingredients")
+    macros = data.get("macros", {})
+
+    lines = [f"🛍️ {name}"]
+    if price:
+        lines.append(f"💰 Cena: {price}")
+
+    lines.append("")
+    if macros:
+        lines.append("📊 Wartości odżywcze (na 100g):")
+        macro_order = ["kcal", "białko", "tłuszcz", "węglowodany", "cukry", "błonnik", "sól"]
+        for key in macro_order:
+            if key in macros:
+                lines.append(f"  {key}: {macros[key]}")
+        for key, val in macros.items():
+            if key not in macro_order:
+                lines.append(f"  {key}: {val}")
+    else:
+        lines.append("📊 Brak danych o wartościach odżywczych.")
+
+    lines.append("")
+    if ingredients:
+        lines.append(f"🧪 Skład: {ingredients}")
+    else:
+        lines.append("🧪 Brak informacji o składzie.")
+
+    return "\n".join(lines)
+
+
+async def _search_navigate_and_cache(page, query: str) -> tuple[str, object | None]:
+    """
+    Search for query, navigate to its product page, cache macros+ingredients,
+    return (found_name, add_to_cart_button_or_None).
+
+    Replaces _search_and_get_first_product in add-to-cart flows so that macro
+    data is captured eagerly and get_product_info can return from cache instantly.
+    """
+    # Step 1: Search via search box
+    await page.get_by_role("textbox", name="Wyszukaj").click()
+    search_input = page.get_by_role("textbox", name="Jakiego produktu szukasz?")
+    await search_input.fill(query)
+    await search_input.press("Enter")
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_timeout(2000)
+
+    # Step 2: Find first visible product URL outside the cart sidebar
+    product_url = await page.evaluate("""() => {
+        function inCartSidebar(el) {
+            let node = el.parentElement;
+            while (node) {
+                const cls = (node.className || '').toString().toLowerCase();
+                if (cls.includes('cart') || cls.includes('basket') || cls.includes('mini-cart')) return true;
+                node = node.parentElement;
+            }
+            const rect = el.getBoundingClientRect();
+            return rect.left > window.innerWidth * 0.65;
+        }
+        const link = Array.from(document.querySelectorAll('a[href*="/pid,"][title]'))
+            .find(el => el.offsetParent !== null && !inCartSidebar(el));
+        return link ? link.href : null;
+    }""")
+
+    if not product_url:
+        return query, None
+
+    if not product_url.startswith("http"):
+        product_url = "https://www.frisco.pl" + product_url
+
+    # Step 3: Navigate to product page
+    await page.goto(product_url)
+    await page.wait_for_load_state("domcontentloaded")
+    await page.wait_for_timeout(2000)
+
+    # Step 4: Expand product info toggles
+    for label in ["Wartości odżywcze", "Skład i alergeny"]:
+        try:
+            await page.get_by_text(label, exact=True).first.click(timeout=2000)
+            await page.wait_for_timeout(800)
+        except Exception:
+            pass
+
+    # Step 5: Scroll to bottom so lazy content loads
+    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+    await page.wait_for_timeout(1000)
+
+    # Step 6: Extract macros + name and cache
+    found_name = query
+    try:
+        info = await page.evaluate(_MACRO_JS)
+        found_name = info.get("name") or query
+        cache_entry = {
+            "name": found_name,
+            "url": product_url,
+            "macros": info.get("macros", {}),
+            "ingredients": info.get("ingredients"),
+            "price": info.get("price", ""),
+        }
+        _product_cache[query] = cache_entry
+        _product_cache[found_name] = cache_entry
+    except Exception:
+        pass
+
+    # Step 7: Find first visible "Do koszyka" button on the product page
+    koszyk_btns = page.get_by_text("Do koszyka")
+    count = await koszyk_btns.count()
+    for i in range(count):
+        btn = koszyk_btns.nth(i)
+        if await btn.is_visible():
+            return found_name, btn
+
+    return found_name, None
 
 
 # ── Recipe tools (no browser) ────────────────────────────────────────────────
@@ -276,7 +486,7 @@ async def add_items_to_cart(items: str, email: str = "", password: str = "") -> 
         qty = item.get("quantity", 1)
 
         try:
-            found_name, add_btn = await _search_and_get_first_product(page, query)
+            found_name, add_btn = await _search_navigate_and_cache(page, query)
 
             if add_btn is None:
                 results.append(f"⚠️  {name}: nie znaleziono")
@@ -386,6 +596,7 @@ async def clear_session() -> str:
     _browser = None
     _page = None
     _logged_in = False
+    _product_cache.clear()
     return "✅ Sesja zamknięta."
 
 
@@ -474,6 +685,14 @@ async def get_product_info(query: str, email: str = "", password: str = "") -> s
 
     page = await get_page()
 
+    # Cache-first: return instantly if already fetched during add-to-cart
+    cached = _product_cache.get(query) or next(
+        (v for v in _product_cache.values() if v.get("name", "").lower() == query.lower()),
+        None,
+    )
+    if cached and cached.get("macros"):
+        return _format_product_info(cached)
+
     # Navigate to search results via search box (URL approach double-encodes Polish chars)
     await page.get_by_role("textbox", name="Wyszukaj").click()
     search_input = page.get_by_role("textbox", name="Jakiego produktu szukasz?")
@@ -483,6 +702,7 @@ async def get_product_info(query: str, email: str = "", password: str = "") -> s
     await page.wait_for_timeout(2000)
 
     # Find first visible product link outside the cart sidebar
+    product_url = ""
     try:
         product_url = await page.evaluate("""() => {
             function inCartSidebar(el) {
@@ -523,124 +743,18 @@ async def get_product_info(query: str, email: str = "", password: str = "") -> s
         return f"❌ Błąd nawigacji do produktu: {e}"
 
     try:
-        info = await page.evaluate(r"""() => {
-            // Product name
-            const h1 = document.querySelector('h1');
-            const name = h1 ? h1.innerText.trim() : '?';
+        info = await page.evaluate(_MACRO_JS)
 
-            // Price
-            const priceEl = document.querySelector('[class*="price"], [class*="Price"]');
-            const price = priceEl ? priceEl.innerText.trim().replace(/\s+/g, ' ') : '';
+        # Store in cache for future calls
+        _product_cache[query] = {
+            "name": info.get("name", "?"),
+            "url": product_url,
+            "macros": info.get("macros", {}),
+            "ingredients": info.get("ingredients"),
+            "price": info.get("price", ""),
+        }
 
-            // Full page text for parsing
-            const bodyText = document.body.innerText;
-
-            // Ingredients: match "Skład:" OR content on the line after "Skład i alergeny" header
-            let ingredients = null;
-            const skladColon = bodyText.match(/Sk[łl]ad\s*[:：]\s*([^\n]{5,})/i);
-            if (skladColon) {
-                ingredients = skladColon[1].trim();
-            } else {
-                // "Skład i alergeny" accordion: grab the next non-empty line(s)
-                const skladSection = bodyText.match(/Sk[łl]ad i alergeny[\s\S]{0,10}\n+([^\n]{5,})/i);
-                if (skladSection) ingredients = skladSection[1].trim();
-            }
-
-            // Macros: walk table rows and definition lists
-            const macros = {};
-            const keyMap = {
-                'kcal': 'kcal',
-                'energia': 'kcal',
-                'białko': 'białko',
-                'bialko': 'białko',
-                'tłuszcz': 'tłuszcz',
-                'tluszcz': 'tłuszcz',
-                'węglowodan': 'węglowodany',
-                'weglowodan': 'węglowodany',
-                'cukr': 'cukry',
-                'błonnik': 'błonnik',
-                'blonnik': 'błonnik',
-                'sól': 'sól',
-                'sol': 'sól',
-            };
-
-            function extractMacro(label, value) {
-                const lc = label.toLowerCase();
-                for (const [key, canonical] of Object.entries(keyMap)) {
-                    if (lc.includes(key) && !macros[canonical]) {
-                        macros[canonical] = value.trim().replace(/\s+/g, ' ');
-                        break;
-                    }
-                }
-            }
-
-            // Try <tr> rows
-            document.querySelectorAll('tr').forEach(tr => {
-                const cells = tr.querySelectorAll('td, th');
-                if (cells.length >= 2) {
-                    extractMacro(cells[0].innerText, cells[1].innerText);
-                }
-            });
-
-            // Try <dt>/<dd> pairs
-            document.querySelectorAll('dt').forEach(dt => {
-                const dd = dt.nextElementSibling;
-                if (dd && dd.tagName === 'DD') {
-                    extractMacro(dt.innerText, dd.innerText);
-                }
-            });
-
-            // Try adjacent sibling divs: label div + value div pattern
-            // Walk all leaf-ish divs/spans; if text looks like a macro keyword,
-            // grab the next sibling's text as the value.
-            document.querySelectorAll('div, span, p, li').forEach(el => {
-                if (el.children.length > 2) return; // skip containers
-                const text = (el.innerText || '').trim();
-                if (!text || text.length > 60) return;
-                const next = el.nextElementSibling;
-                if (next && next.children.length <= 2) {
-                    extractMacro(text, next.innerText || '');
-                }
-            });
-
-            // Fallback: regex scan of full page text for kcal only
-            if (!macros['kcal']) {
-                const m = bodyText.match(/([\d]+)\s*kcal/i);
-                if (m) macros['kcal'] = m[1] + ' kcal';
-            }
-
-            return { name, price, ingredients, macros };
-        }""")
-
-        name = info.get("name", "?")
-        price = info.get("price", "")
-        ingredients = info.get("ingredients")
-        macros = info.get("macros", {})
-
-        lines = [f"🛍️ {name}"]
-        if price:
-            lines.append(f"💰 Cena: {price}")
-
-        lines.append("")
-        if macros:
-            lines.append("📊 Wartości odżywcze (na 100g):")
-            macro_order = ["kcal", "białko", "tłuszcz", "węglowodany", "cukry", "błonnik", "sól"]
-            for key in macro_order:
-                if key in macros:
-                    lines.append(f"  {key}: {macros[key]}")
-            for key, val in macros.items():
-                if key not in macro_order:
-                    lines.append(f"  {key}: {val}")
-        else:
-            lines.append("📊 Brak danych o wartościach odżywczych.")
-
-        lines.append("")
-        if ingredients:
-            lines.append(f"🧪 Skład: {ingredients}")
-        else:
-            lines.append("🧪 Brak informacji o składzie.")
-
-        return "\n".join(lines)
+        return _format_product_info(info)
 
     except Exception as e:
         return f"❌ Błąd odczytu informacji o produkcie: {e}"
@@ -726,7 +840,7 @@ async def add_recipe_to_cart(
         needed_qty = base_qty * scale
 
         try:
-            found_name, add_btn = await _search_and_get_first_product(page, query)
+            found_name, add_btn = await _search_navigate_and_cache(page, query)
 
             if add_btn is None:
                 results.append(f"⚠️  {ing_name}: nie znaleziono produktu")
