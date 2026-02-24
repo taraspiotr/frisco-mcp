@@ -90,7 +90,7 @@ data = _load_recipes()
 recipe = next((r for r in data["recipes"] if r["name"] == "Spaghetti bolognese"), None)
 print(f"Recipe in file: {json.dumps(recipe, ensure_ascii=False, indent=2)}")
 
-input("\n✅ Recipe tests done. Press Enter to start BROWSER tests (Chromium will open)...")
+print("\n✅ Recipe tests done. Starting BROWSER tests (Chromium will open)...")
 
 # ── 2. Browser tools ─────────────────────────────────────────────────────────
 

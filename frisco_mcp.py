@@ -291,18 +291,27 @@ async def view_cart(email: str, password: str) -> str:
             const boxes = Array.from(document.querySelectorAll('.product-box_holder'))
                 .filter(el => el.offsetParent !== null);
 
-            const items = boxes.map(box => {
+            // Deduplicate: if the same product appears in two sections (list + summary strip),
+            // keep the entry with a price; otherwise keep first seen.
+            const byName = new Map();
+            boxes.forEach(box => {
                 const nameEl = box.querySelector('a[title]');
-                const name = nameEl ? nameEl.title : '?';
+                const name = nameEl ? nameEl.title : null;
+                if (!name) return;
 
                 const priceEl = box.querySelector('[class*="price"], [class*="Price"]');
                 const price = priceEl ? priceEl.innerText.trim().replace(/\\s+/g, ' ') : '';
 
-                const qtyEl = box.querySelector('input[type="number"], [class*="stepper"], [class*="quantity"]');
+                const qtyEl = box.querySelector(
+                    'input[type="number"], [class*="stepper"], [class*="Quantity"], [class*="quantity"]'
+                );
                 const qty = qtyEl ? (qtyEl.value || qtyEl.innerText || '1').trim() : '1';
 
-                return { name, price, qty };
+                if (!byName.has(name) || (!byName.get(name).price && price)) {
+                    byName.set(name, { name, price, qty });
+                }
             });
+            const items = Array.from(byName.values());
 
             const totalEl = document.querySelector(
                 '[class*="summary"] [class*="price"], [class*="checkout"] [class*="total"], ' +
@@ -366,15 +375,28 @@ async def search_products(email: str, password: str, query: str, top_n: int = 5)
         return "❌ Nie udało się zalogować."
 
     page = await get_page()
-    encoded_query = query.replace(" ", "+")
-    await page.goto(f"https://www.frisco.pl/q,{encoded_query}/stn,searchResults")
+    await page.get_by_role("textbox", name="Wyszukaj").click()
+    search_input = page.get_by_role("textbox", name="Jakiego produktu szukasz?")
+    await search_input.fill(query)
+    await search_input.press("Enter")
     await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(2000)
 
     try:
         products = await page.evaluate(f"""() => {{
+            function inCartSidebar(el) {{
+                let node = el.parentElement;
+                while (node) {{
+                    const cls = (node.className || '').toString().toLowerCase();
+                    if (cls.includes('cart') || cls.includes('basket') || cls.includes('mini-cart')) return true;
+                    node = node.parentElement;
+                }}
+                const rect = el.getBoundingClientRect();
+                return rect.left > window.innerWidth * 0.65;
+            }}
+
             const boxes = Array.from(document.querySelectorAll('.product-box_holder'))
-                .filter(el => el.offsetParent !== null)
+                .filter(el => el.offsetParent !== null && !inCartSidebar(el))
                 .slice(0, {top_n});
 
             return boxes.map(box => {{
@@ -417,21 +439,32 @@ async def get_product_info(email: str, password: str, query: str) -> str:
         return "❌ Nie udało się zalogować."
 
     page = await get_page()
-    encoded_query = query.replace(" ", "+")
-    await page.goto(f"https://www.frisco.pl/q,{encoded_query}/stn,searchResults")
+
+    # Navigate to search results via search box (URL approach double-encodes Polish chars)
+    await page.get_by_role("textbox", name="Wyszukaj").click()
+    search_input = page.get_by_role("textbox", name="Jakiego produktu szukasz?")
+    await search_input.fill(query)
+    await search_input.press("Enter")
     await page.wait_for_load_state("domcontentloaded")
     await page.wait_for_timeout(2000)
 
-    # Find first visible product link
+    # Find first visible product link outside the cart sidebar
     try:
-        product_links = page.locator("a[href*='/pid,'][title]")
-        count = await product_links.count()
-        product_url = None
-        for i in range(count):
-            link = product_links.nth(i)
-            if await link.is_visible():
-                product_url = await link.get_attribute("href")
-                break
+        product_url = await page.evaluate("""() => {
+            function inCartSidebar(el) {
+                let node = el.parentElement;
+                while (node) {
+                    const cls = (node.className || '').toString().toLowerCase();
+                    if (cls.includes('cart') || cls.includes('basket') || cls.includes('mini-cart')) return true;
+                    node = node.parentElement;
+                }
+                const rect = el.getBoundingClientRect();
+                return rect.left > window.innerWidth * 0.65;
+            }
+            const link = Array.from(document.querySelectorAll('a[href*="/pid,"][title]'))
+                .find(el => el.offsetParent !== null && !inCartSidebar(el));
+            return link ? link.href : null;
+        }""")
 
         if not product_url:
             return f"❌ Nie znaleziono produktu dla: '{query}'"
@@ -442,6 +475,15 @@ async def get_product_info(email: str, password: str, query: str) -> str:
         await page.goto(product_url)
         await page.wait_for_load_state("domcontentloaded")
         await page.wait_for_timeout(2000)
+        # Expand the two product info toggles
+        for label in ["Wartości odżywcze", "Skład i alergeny"]:
+            try:
+                await page.get_by_text(label, exact=True).first.click(timeout=2000)
+                await page.wait_for_timeout(800)
+            except Exception:
+                pass
+        await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+        await page.wait_for_timeout(1000)
 
     except Exception as e:
         return f"❌ Błąd nawigacji do produktu: {e}"
@@ -459,9 +501,16 @@ async def get_product_info(email: str, password: str, query: str) -> str:
             // Full page text for parsing
             const bodyText = document.body.innerText;
 
-            // Ingredients: text after "Skład:"
-            const skladMatch = bodyText.match(/Sk[łl]ad\s*[:：]\s*([^\n]{10,})/i);
-            const ingredients = skladMatch ? skladMatch[1].trim() : null;
+            // Ingredients: match "Skład:" OR content on the line after "Skład i alergeny" header
+            let ingredients = null;
+            const skladColon = bodyText.match(/Sk[łl]ad\s*[:：]\s*([^\n]{5,})/i);
+            if (skladColon) {
+                ingredients = skladColon[1].trim();
+            } else {
+                // "Skład i alergeny" accordion: grab the next non-empty line(s)
+                const skladSection = bodyText.match(/Sk[łl]ad i alergeny[\s\S]{0,10}\n+([^\n]{5,})/i);
+                if (skladSection) ingredients = skladSection[1].trim();
+            }
 
             // Macros: walk table rows and definition lists
             const macros = {};
@@ -507,9 +556,22 @@ async def get_product_info(email: str, password: str, query: str) -> str:
                 }
             });
 
-            // Fallback: regex on body text
+            // Try adjacent sibling divs: label div + value div pattern
+            // Walk all leaf-ish divs/spans; if text looks like a macro keyword,
+            // grab the next sibling's text as the value.
+            document.querySelectorAll('div, span, p, li').forEach(el => {
+                if (el.children.length > 2) return; // skip containers
+                const text = (el.innerText || '').trim();
+                if (!text || text.length > 60) return;
+                const next = el.nextElementSibling;
+                if (next && next.children.length <= 2) {
+                    extractMacro(text, next.innerText || '');
+                }
+            });
+
+            // Fallback: regex scan of full page text for kcal only
             if (!macros['kcal']) {
-                const m = bodyText.match(/(\d+[\s,]\d*)\s*kcal/i);
+                const m = bodyText.match(/([\d]+)\s*kcal/i);
                 if (m) macros['kcal'] = m[1] + ' kcal';
             }
 
